@@ -1,5 +1,41 @@
-import { pool } from "../lib/db.js";
+import { pool, isRetryablePoolError } from "../lib/db.js";
 import { logger } from "./logger.js";
+
+// Retry configuration for RLS operations
+const RLS_RETRY_ATTEMPTS = Number.parseInt(
+  process.env.RLS_RETRY_ATTEMPTS || "3",
+  10,
+);
+const RLS_RETRY_DELAY_MS = Number.parseInt(
+  process.env.RLS_RETRY_DELAY_MS || "100",
+  10,
+);
+const RLS_RETRY_MAX_DELAY_MS = Number.parseInt(
+  process.env.RLS_RETRY_MAX_DELAY_MS || "5000",
+  10,
+);
+
+/**
+ * Sleep utility for retry delays
+ */
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Calculate exponential backoff delay with jitter
+ *
+ * @param {number} attempt - Current attempt number (0-based)
+ * @param {number} baseDelayMs - Base delay in milliseconds
+ * @param {number} maxDelayMs - Maximum delay in milliseconds
+ * @returns {number} - Delay in milliseconds
+ */
+function calculateBackoffDelay(attempt, baseDelayMs, maxDelayMs) {
+  const exponentialDelay = baseDelayMs * Math.pow(2, attempt);
+  const jitter = Math.random() * 0.1 * exponentialDelay; // Add 10% jitter
+  const delay = Math.min(exponentialDelay + jitter, maxDelayMs);
+  return Math.floor(delay);
+}
 
 /**
  * Executes a callback within a transaction where the merchant context is set.
@@ -23,6 +59,88 @@ export async function withMerchantContext(merchantId, callback) {
   } finally {
     client.release();
   }
+}
+
+/**
+ * Executes a callback within a transaction with merchant context and automatic retry.
+ *
+ * Uses exponential backoff with jitter for retry delays. Each retry opens a new
+ * transaction on a fresh client to avoid issues with mid-transaction connection drops.
+ *
+ * @param {string} merchantId - The merchant ID for RLS context
+ * @param {Function} callback - Function to execute with the client
+ * @param {Object} options - Retry options
+ * @param {number} options.retryAttempts - Maximum number of retry attempts
+ * @param {number} options.retryDelayMs - Base delay for exponential backoff
+ * @param {number} options.retryMaxDelayMs - Maximum delay for exponential backoff
+ * @param {string} options.label - Label for logging
+ * @returns {Promise<*>} - Result of the callback
+ */
+export async function withMerchantContextRetry(
+  merchantId,
+  callback,
+  {
+    retryAttempts = RLS_RETRY_ATTEMPTS,
+    retryDelayMs = RLS_RETRY_DELAY_MS,
+    retryMaxDelayMs = RLS_RETRY_MAX_DELAY_MS,
+    label = "rls-query",
+  } = {},
+) {
+  let lastError;
+
+  for (let attempt = 0; attempt <= retryAttempts; attempt += 1) {
+    try {
+      return await withMerchantContext(merchantId, callback);
+    } catch (err) {
+      lastError = err;
+      const shouldRetry = attempt < retryAttempts && isRetryablePoolError(err);
+
+      if (!shouldRetry) {
+        logger.error(
+          {
+            err: err.message,
+            code: err.code,
+            label,
+            attempt: attempt + 1,
+            maxAttempts: retryAttempts + 1,
+            retryable: false,
+          },
+          "RLS query failed (non-retryable)",
+        );
+        throw err;
+      }
+
+      const delayMs = calculateBackoffDelay(attempt, retryDelayMs, retryMaxDelayMs);
+
+      logger.warn(
+        {
+          err: err.message,
+          code: err.code,
+          label,
+          attempt: attempt + 1,
+          maxAttempts: retryAttempts + 1,
+          delayMs,
+          nextRetryIn: delayMs,
+        },
+        "RLS query failed, retrying with exponential backoff",
+      );
+
+      await sleep(delayMs);
+    }
+  }
+
+  logger.error(
+    {
+      err: lastError?.message,
+      code: lastError?.code,
+      label,
+      attempts: retryAttempts + 1,
+      exhausted: true,
+    },
+    "RLS query retry attempts exhausted",
+  );
+
+  throw lastError;
 }
 
 /**

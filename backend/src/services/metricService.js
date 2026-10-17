@@ -1,19 +1,7 @@
-import { withMerchantContext } from "../lib/db-rls.js";
-import { queryWithRetry, circuitBreaker, isRetryablePoolError } from "../lib/db.js";
+import { withMerchantContextRetry } from "../lib/db-rls.js";
+import { circuitBreaker, queryWithRetry } from "../lib/db.js";
 
 const VALID_VOLUME_RANGES = { "7D": 7, "30D": 30, "1Y": 365 };
-const RLS_QUERY_RETRY_ATTEMPTS = Number.parseInt(
-  process.env.DB_POOL_RETRY_ATTEMPTS || "2",
-  10,
-);
-const RLS_QUERY_RETRY_DELAY_MS = Number.parseInt(
-  process.env.DB_POOL_RETRY_DELAY_MS || "150",
-  10,
-);
-
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
 
 /** Format a Date as a YYYY-MM-DD string in UTC. */
 function toDateStr(date) {
@@ -21,33 +9,13 @@ function toDateStr(date) {
 }
 
 /**
- * Run an RLS-scoped query (via withMerchantContext) with retry + the shared
- * circuit breaker. A statement can't be retried mid-transaction once the
- * connection drops, so each attempt opens a brand-new transaction on a fresh
- * client instead of retrying within one (issue #930).
+ * Run an RLS-scoped query (via withMerchantContextRetry) with retry + the shared
+ * circuit breaker. Uses the centralized withMerchantContextRetry which implements
+ * exponential backoff with jitter for resilient retry logic (issue #1469).
  */
-async function withMerchantContextRetry(merchantId, callback, { label = "rls-query" } = {}) {
+async function withMerchantContextRetryWithCircuitBreaker(merchantId, callback, { label = "rls-query" } = {}) {
   return circuitBreaker.execute(async () => {
-    let lastError;
-
-    for (let attempt = 0; attempt <= RLS_QUERY_RETRY_ATTEMPTS; attempt += 1) {
-      try {
-        return await withMerchantContext(merchantId, callback);
-      } catch (err) {
-        lastError = err;
-        const shouldRetry = attempt < RLS_QUERY_RETRY_ATTEMPTS && isRetryablePoolError(err);
-        if (!shouldRetry) {
-          throw err;
-        }
-        const delayMs = RLS_QUERY_RETRY_DELAY_MS * (attempt + 1);
-        console.warn(
-          `[metricService] ${label} failed (attempt ${attempt + 1}/${RLS_QUERY_RETRY_ATTEMPTS + 1}): ${err.message}. Retrying in ${delayMs}ms.`,
-        );
-        await sleep(delayMs);
-      }
-    }
-
-    throw lastError;
+    return withMerchantContextRetry(merchantId, callback, { label });
   });
 }
 
@@ -89,7 +57,7 @@ export const metricService = {
       ORDER BY asset, asset_issuer
     `;
 
-    const { rows } = await withMerchantContextRetry(
+    const { rows } = await withMerchantContextRetryWithCircuitBreaker(
       merchantId,
       (client) =>
         client.query(combinedQuery, [
@@ -162,9 +130,11 @@ export const metricService = {
       ORDER BY asset, asset_issuer
     `;
 
-    const { rows } = await queryWithRetry(query, [merchantId], {
-      label: "metrics-revenue-by-asset",
-    });
+    const { rows } = await withMerchantContextRetryWithCircuitBreaker(
+      merchantId,
+      (client) => client.query(query, [merchantId]),
+      { label: "metrics-revenue-by-asset" },
+    );
 
     return {
       revenue: rows.map((row) => ({
@@ -197,9 +167,11 @@ export const metricService = {
       ORDER BY 1 ASC, 2 ASC
     `;
 
-    const { rows } = await queryWithRetry(query, [merchantId, days], {
-      label: "metrics-volume-over-time",
-    });
+    const { rows } = await withMerchantContextRetryWithCircuitBreaker(
+      merchantId,
+      (client) => client.query(query, [merchantId, days]),
+      { label: "metrics-volume-over-time" },
+    );
 
     // Collect all distinct assets across the result set
     const assetSet = new Set(rows.map((r) => r.asset));
